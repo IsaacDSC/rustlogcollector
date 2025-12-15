@@ -1,0 +1,261 @@
+================================================================================
+    RUST LOG COLLECTOR - ARQUITETURA DE 2 THREADS
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           PROCESSO PRINCIPAL                             │
+│                         #[tokio::main] main()                            │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ Cria Store compartilhado
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │    Store::new(50)             │
+                    │    Arc<Mutex<Vec<Vec<u8>>>>   │
+                    │    - Thread-safe              │
+                    │    - Batches de 50 linhas     │
+                    └───────────────────────────────┘
+                                    │
+                    ┌───────────────┴────────────────┐
+                    │                                │
+                    ▼                                ▼
+    ┌───────────────────────────┐      ┌───────────────────────────┐
+    │      THREAD 1             │      │      THREAD 2             │
+    │  tokio::spawn()           │      │  tokio::spawn()           │
+    │  collect_logs()           │      │  start_http_server()      │
+    └───────────────────────────┘      └───────────────────────────┘
+                │                                    │
+                │                                    │
+    ┌───────────▼───────────┐          ┌────────────▼────────────┐
+    │   LOG COLLECTOR       │          │   HTTP SERVER           │
+    │   ═══════════════     │          │   ════════════          │
+    │                       │          │                         │
+    │  1. Executa comando   │          │  Axum Framework         │
+    │     configurado       │          │  Porta: 3000            │
+    │                       │          │                         │
+    │  2. Command::new()    │          │  Endpoints:             │
+    │     .stdout(piped)    │          │  ┌──────────────────┐   │
+    │     .stderr(piped)    │          │  │ GET /            │   │
+    │                       │          │  │ Info da API      │   │
+    │  3. BufReader         │          │  └──────────────────┘   │
+    │     AsyncBufReadExt   │          │  ┌──────────────────┐   │
+    │                       │          │  │ GET /logs        │   │
+    │  4. while let Ok()    │          │  │ Retorna logs     │   │
+    │     .next_line()      │          │  └──────────────────┘   │
+    │                       │          │                         │
+    │  5. store.add(bytes)  │          │  State: AppState        │
+    │                       │          │    └─ store: Store      │
+    └───────────────────────┘          └─────────────────────────┘
+                │                                    │
+                │                                    │
+                └─────────────┬──────────────────────┘
+                              │
+                              ▼
+                ┌─────────────────────────────┐
+                │   SHARED STORE              │
+                │   ══════════════            │
+                │                             │
+                │   Arc<Mutex<>>              │
+                │   Thread-safe access        │
+                │                             │
+                │   Batches:                  │
+                │   [Batch 1] ← 50 linhas     │
+                │   [Batch 2] ← 50 linhas     │
+                │   [Batch 3] ← 25 linhas     │
+                │   ...                       │
+                │                             │
+                │   Métodos:                  │
+                │   • add(log)                │
+                │   • retrieve_first()        │
+                └─────────────────────────────┘
+
+
+================================================================================
+                           FLUXO DE DADOS
+================================================================================
+
+THREAD 1 (Log Collector):
+─────────────────────────
+  Programa Externo
+       │
+       ├─── stdout ──┐
+       │             │
+       └─── stderr ──┤
+                     │
+                     ▼
+            BufReader (async)
+                     │
+                     ▼
+           for linha in linhas
+                     │
+                     ▼
+         linha.into_bytes()
+                     │
+                     ▼
+           store.add(bytes)
+                     │
+                     ▼
+         ┌──────────────────┐
+         │ Batch atual      │
+         │ [log1, log2, ...] │
+         └──────────────────┘
+
+
+THREAD 2 (HTTP Server):
+───────────────────────
+  Cliente HTTP
+       │
+       ▼
+  GET /logs
+       │
+       ▼
+  get_logs(State)
+       │
+       ▼
+  store.retrieve_first()
+       │
+       ├─── Ok(batch) ────► Converter para String
+       │                            │
+       │                            ▼
+       │                    LogResponse { success: true }
+       │                            │
+       └─── Err() ─────────► LogResponse { success: false }
+                                    │
+                                    ▼
+                            JSON Response (200/404)
+
+
+================================================================================
+                        ESTRUTURAS DE DADOS
+================================================================================
+
+Store:
+  ┌──────────────────────────────────────────┐
+  │ max_size: 50                             │
+  │ data: Arc<Mutex<Vec<Vec<Vec<u8>>>>>      │
+  │       │    │    │   │   └─ bytes da linha│
+  │       │    │    │   └───── linha         │
+  │       │    │    └─────────── batch       │
+  │       │    └──────────────── todos batches│
+  │       └───────────────────── mutex       │
+  └──────────────────────────────────────────┘
+
+AppState:
+  ┌──────────────────────────────────────────┐
+  │ store: Store                             │
+  │   └─ clone do Store compartilhado        │
+  └──────────────────────────────────────────┘
+
+LogResponse:
+  ┌──────────────────────────────────────────┐
+  │ success: bool                            │
+  │ logs: Option<Vec<String>>                │
+  │ error: Option<String>                    │
+  └──────────────────────────────────────────┘
+
+
+================================================================================
+                         CONFIGURAÇÃO
+================================================================================
+
+Variáveis de Ambiente:
+  MONITOR_CMD   = comando a executar (default: "ping")
+  MONITOR_ARGS  = args separados por vírgula (default: "localhost,-c,100")
+
+Exemplo:
+  MONITOR_CMD="python3" MONITOR_ARGS="script.py,arg1,arg2" cargo run
+
+
+================================================================================
+                    SINCRONIZAÇÃO E THREAD-SAFETY
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────┐
+│  Thread 1                    Store                  Thread 2    │
+│                                                                  │
+│  add(log)          →    Lock acquired       ←    retrieve()     │
+│    │                         │                        │         │
+│    │                    Push to batch                 │         │
+│    │                         │                   Remove batch   │
+│    │                    Lock released                 │         │
+│    ▼                         ▼                        ▼         │
+│  Continue              Arc reference           Return data      │
+└─────────────────────────────────────────────────────────────────┘
+
+Mutex garante:
+  ✓ Apenas uma thread acessa dados por vez
+  ✓ Sem race conditions
+  ✓ Sem data corruption
+
+
+================================================================================
+                         EXEMPLO DE USO
+================================================================================
+
+Terminal 1:
+  $ ./run_with_log_generator.sh
+  [LOG COLLECTOR] Iniciando coleta de logs...
+  [LOG COLLECTOR] Executando: python3 ["examples/log_generator.py"]
+  [HTTP SERVER] Servidor rodando em http://0.0.0.0:3000
+  [STDOUT] Log Generator iniciado!
+  [STDOUT] [INFO] 2024-01-15 10:30:01 - Log #1
+  [STDOUT] [INFO] 2024-01-15 10:30:03 - Log #2
+  [STDERR] [ERROR] 2024-01-15 10:30:05 - Erro #3
+
+Terminal 2:
+  $ curl -s http://localhost:3000/logs | jq '.'
+  {
+    "success": true,
+    "logs": [
+      "Log Generator iniciado!",
+      "[INFO] 2024-01-15 10:30:01 - Log #1",
+      "[INFO] 2024-01-15 10:30:03 - Log #2",
+      "[ERROR] 2024-01-15 10:30:05 - Erro #3"
+    ]
+  }
+
+
+================================================================================
+                      TECNOLOGIAS UTILIZADAS
+================================================================================
+
+┌────────────────────┬──────────────────────────────────────────────┐
+│ Tokio              │ Runtime assíncrono para Rust                 │
+│                    │ - tokio::spawn() para threads                │
+│                    │ - tokio::process::Command para executar      │
+│                    │ - AsyncBufReadExt para leitura não-bloqueante│
+├────────────────────┼──────────────────────────────────────────────┤
+│ Axum               │ Framework web                                │
+│                    │ - Router para rotas                          │
+│                    │ - State para compartilhar dados              │
+│                    │ - Json para serialização                     │
+├────────────────────┼──────────────────────────────────────────────┤
+│ Serde              │ Serialização/Deserialização                  │
+│                    │ - Derive macros                              │
+│                    │ - JSON support                               │
+├────────────────────┼──────────────────────────────────────────────┤
+│ Arc<Mutex<>>       │ Sincronização thread-safe                    │
+│                    │ - Arc: Reference counting                    │
+│                    │ - Mutex: Mutual exclusion                    │
+└────────────────────┴──────────────────────────────────────────────┘
+
+
+================================================================================
+                          PERFORMANCE
+================================================================================
+
+Características:
+  ✓ I/O não-bloqueante (async/await)
+  ✓ Zero-copy quando possível
+  ✓ Batching reduz overhead de HTTP requests
+  ✓ Lock granular (apenas durante add/retrieve)
+
+Capacidade estimada:
+  • ~10,000 linhas/segundo (depende do programa monitorado)
+  • ~200 HTTP requests/segundo (depende do batch size)
+  • Memória: ~1KB por linha (estimativa)
+
+
+================================================================================
+FIM DA DOCUMENTAÇÃO
+================================================================================
